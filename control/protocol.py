@@ -1,0 +1,41 @@
+COMMAND_BYTES = {
+    "S": 0x00,
+    "F": 0x01,
+    "SEARCH": 0x01,
+    "L": 0x03,
+    "B": 0x05,
+    "R": 0x07,
+    "ARM_ROTATE": 0x10,
+    "ARM_UP": 0x11,
+    "ARM_DOWN": 0x13,
+    "ARM_CENTER": 0x15,
+    "FAST_RIGHT": 0x21,
+    "ACT_STAGE_1": 0x22,
+    "ACT_STAGE_2": 0x23,
+    "TURN_AND_ADVANCE": 0x09,
+}
+
+MOTION_TEXT = {
+    "F": "FORWARD",
+    "L": "LEFT",
+    "R": "RIGHT",
+    "S": "STOP",
+    "B": "BACK",
+    "SEARCH": "SEARCH",
+    "FAST_RIGHT": "FAST_RIGHT",
+    "ARM_ROTATE": "ARM_ROTATE",
+    "ARM_UP": "ARM_UP",
+    "ARM_DOWN": "ARM_DOWN",
+    "ARM_CENTER": "ARM_CENTER",
+    "ACT_STAGE_1": "ACT_STAGE_1",
+    "ACT_STAGE_2": "ACT_STAGE_2",
+    "TURN_AND_ADVANCE": "TURN_AND_ADVANCE",
+}
+
+
+def motion_to_text(motion):
+    return MOTION_TEXT.get(motion, motion)
+
+
+def motion_to_byte(motion):
+    return COMMAND_BYTES.get(motion)
