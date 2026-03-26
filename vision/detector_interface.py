@@ -1,10 +1,6 @@
 class BaseDetector:
-    """Unified detector interface.
-
-    The current project uses HSV-based color detection first.
-    Later, a YOLOv8 detector can implement the same method so the
-    main loop does not need to change.
-    """
+    """统一的检测器接口。"""
+    # 主循环只依赖这个接口，不关心底层到底是颜色分割还是 YOLO。
 
     def detect(self, frame, processed, color_names):
         raise NotImplementedError

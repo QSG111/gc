@@ -3,6 +3,7 @@ import numpy as np
 
 
 def detect_obstacles(frame):
+    # 在画面下半部分做简单边缘检测，粗略判断左右中三个方向的障碍密度。
     height, width = frame.shape[:2]
     roi = frame[int(height * 0.45) :, :]
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
@@ -23,5 +24,6 @@ def detect_obstacles(frame):
         "left_ratio": left_ratio,
         "center_ratio": center_ratio,
         "right_ratio": right_ratio,
+        # 中间区域边缘过多时，认为正前方被挡住。
         "blocked": center_ratio > 0.12,
     }

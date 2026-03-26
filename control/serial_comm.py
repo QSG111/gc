@@ -9,6 +9,7 @@ except Exception:
 
 class SerialController:
     def __init__(self):
+        # last_command 用于避免连续发送完全相同的指令。
         self.last_command = None
         self.ser = None
 
@@ -25,6 +26,7 @@ class SerialController:
             self.ser = None
 
     def send(self, command):
+        # 重复命令直接忽略，减轻串口负担，也避免下位机反复触发同一动作。
         if command == self.last_command:
             return
         self.last_command = command
@@ -34,5 +36,6 @@ class SerialController:
             self.ser.write(bytes([cmd_byte]))
 
     def close(self):
+        # 程序退出前主动关闭串口。
         if self.ser is not None:
             self.ser.close()

@@ -11,6 +11,7 @@ def draw_status_panel(
     mission_info,
     safe_zone_info,
 ):
+    # 把当前帧的关键调试信息统一绘制到预览画面上。
     lines = [
         f"brightness: {quality_info['brightness']:.1f}",
         f"sharpness: {quality_info['sharpness']:.1f}",
@@ -25,11 +26,15 @@ def draw_status_panel(
         f"target: {mission_info['target_color']}",
         f"task_idx: {mission_info['task_index'] + 1}/{mission_info['task_count']}",
         f"carry_count: {mission_info['carry_count']}",
+        f"delivered: {mission_info['delivered_count']}",
         f"phase: {mission_info['phase']}",
         f"note: {mission_info['note']}",
         f"side: {safe_zone_info['friendly_color']}",
         f"safe_zone: {safe_zone_info['friendly_found']}",
         f"safe_region: {safe_zone_info['friendly_region']}",
+        f"enemy_zone: {safe_zone_info['enemy_found']}",
+        f"enemy_region: {safe_zone_info['enemy_region']}",
+        f"enemy_close: {safe_zone_info['enemy_danger_close']}",
         f"motion: {motion_text}",
     ]
 

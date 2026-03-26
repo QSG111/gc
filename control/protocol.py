@@ -1,3 +1,4 @@
+# 上位机动作名到下位机单字节协议的映射表。
 COMMAND_BYTES = {
     "S": 0x00,
     "F": 0x01,
@@ -15,6 +16,7 @@ COMMAND_BYTES = {
     "TURN_AND_ADVANCE": 0x09,
 }
 
+# 调试窗口显示用的动作文字。
 MOTION_TEXT = {
     "F": "FORWARD",
     "L": "LEFT",
@@ -38,4 +40,5 @@ def motion_to_text(motion):
 
 
 def motion_to_byte(motion):
+    # 把上位机动作转换成串口发送字节。
     return COMMAND_BYTES.get(motion)

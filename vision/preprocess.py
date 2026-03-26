@@ -10,13 +10,9 @@ from config import (
 
 
 def preprocess_frame(frame):
-    """OpenCV preprocessing before detection.
-
-    This stage is where we improve image quality before later YOLO use:
-    - denoise with Gaussian blur
-    - enhance local contrast with CLAHE
-    - prepare gray / hsv views once per frame
-    """
+    """做检测前的基础预处理。"""
+    # 这一层负责降噪、增强对比度，并统一生成 HSV / 灰度图，
+    # 避免后续多个模块重复做颜色空间转换。
     blurred = cv2.GaussianBlur(frame, (GAUSSIAN_KERNEL_SIZE, GAUSSIAN_KERNEL_SIZE), 0)
     enhanced = apply_clahe_if_enabled(blurred)
     hsv = cv2.cvtColor(enhanced, cv2.COLOR_BGR2HSV)
@@ -31,6 +27,7 @@ def preprocess_frame(frame):
 
 
 def apply_clahe_if_enabled(frame):
+    # 在亮度不均匀的赛场里，CLAHE 往往比简单拉伸更稳。
     if not ENABLE_CLAHE:
         return frame
 

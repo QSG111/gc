@@ -5,6 +5,7 @@ from config import COLOR_MIN_AREA
 
 
 COLOR_RANGES = {
+    # 所有颜色阈值统一放在这里，方便现场集中调参。
     "red": [
         (np.array([0, 100, 100]), np.array([10, 255, 255])),
         (np.array([160, 100, 100]), np.array([180, 255, 255])),
@@ -27,7 +28,7 @@ COLOR_RANGES = {
 
 
 def build_color_mask(hsv, color_name):
-    """Build a binary mask for one logical color."""
+    """根据颜色名生成对应的二值掩膜。"""
     mask = None
     for lower, upper in COLOR_RANGES[color_name]:
         current = cv2.inRange(hsv, lower, upper)
@@ -36,7 +37,7 @@ def build_color_mask(hsv, color_name):
 
 
 def empty_target_info(color_name="none"):
-    """Return a standard empty detection result."""
+    """返回统一格式的空检测结果。"""
     return {
         "found": False,
         "color": color_name,
@@ -49,7 +50,7 @@ def empty_target_info(color_name="none"):
 
 
 def detect_largest_target(hsv_frame, color_name, min_area=COLOR_MIN_AREA):
-    """Detect the largest blob for one target color."""
+    """检测指定颜色中面积最大的一个目标。"""
     mask = build_color_mask(hsv_frame, color_name)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -57,6 +58,7 @@ def detect_largest_target(hsv_frame, color_name, min_area=COLOR_MIN_AREA):
     largest_area = 0.0
     for contour in contours:
         area = cv2.contourArea(contour)
+        # 过滤掉面积太小的噪声区域。
         if area >= min_area and area > largest_area:
             largest_area = area
             largest = contour
@@ -77,7 +79,7 @@ def detect_largest_target(hsv_frame, color_name, min_area=COLOR_MIN_AREA):
 
 
 def detect_targets(hsv_frame, color_names):
-    """Detect all configured color targets in one frame."""
+    """在一帧里批量检测多个颜色目标。"""
     return {
         color_name: detect_largest_target(hsv_frame, color_name)
         for color_name in color_names

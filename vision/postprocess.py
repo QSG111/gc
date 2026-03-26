@@ -2,12 +2,9 @@ from vision.color_targets import empty_target_info
 
 
 def merge_detection_results(color_results, yolo_results, color_names):
-    """Merge classical OpenCV detections with future YOLO detections.
-
-    Current strategy:
-    - prefer YOLO if it has a valid detection
-    - otherwise fall back to color-based OpenCV detection
-    """
+    """融合传统 OpenCV 检测结果和 YOLO 检测结果。"""
+    # 当前策略很简单：YOLO 只要有有效结果就优先使用，
+    # 否则回退到颜色分割结果。
     merged = {}
     for color_name in color_names:
         yolo_item = yolo_results.get(color_name, empty_target_info(color_name))

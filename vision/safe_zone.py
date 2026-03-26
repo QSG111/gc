@@ -4,14 +4,17 @@ from mission.task_config import GAME_RULES
 from vision.color_targets import build_color_mask
 
 
-def detect_safe_zones(hsv_frame):
-    """Detect friendly and enemy safe-zone color blocks.
+SAFE_ZONE_FOUND_AREA = 3000
+SAFE_ZONE_DANGER_AREA = 12000
 
-    The current implementation only checks the top and bottom parts
-    of the frame, which matches the赛场示意图中的安全区大致位置.
-    """
+
+def detect_safe_zones(hsv_frame):
+    """检测己方和对方安全区颜色块。"""
     hsv = hsv_frame
-    height, width = hsv.shape[:2]
+    height, _ = hsv.shape[:2]
+
+    # 按赛场示意图，安全区更可能出现在画面上下区域，
+    # 所以这里只截取上下两个 ROI，减少计算量和误检。
     rois = {
         "top": hsv[: int(height * 0.35), :],
         "bottom": hsv[int(height * 0.65) :, :],
@@ -26,9 +29,11 @@ def detect_safe_zones(hsv_frame):
         "friendly_found": False,
         "friendly_area": 0.0,
         "friendly_region": "none",
+        "friendly_danger_close": False,
         "enemy_found": False,
         "enemy_area": 0.0,
         "enemy_region": "none",
+        "enemy_danger_close": False,
     }
 
     for region_name, roi in rois.items():
@@ -39,12 +44,18 @@ def detect_safe_zones(hsv_frame):
 
         if friendly_area > info["friendly_area"]:
             info["friendly_area"] = friendly_area
-            info["friendly_found"] = friendly_area > 3000
+            info["friendly_found"] = friendly_area > SAFE_ZONE_FOUND_AREA
             info["friendly_region"] = region_name
+            info["friendly_danger_close"] = (
+                region_name == "bottom" and friendly_area > SAFE_ZONE_DANGER_AREA
+            )
 
         if enemy_area > info["enemy_area"]:
             info["enemy_area"] = enemy_area
-            info["enemy_found"] = enemy_area > 3000
+            info["enemy_found"] = enemy_area > SAFE_ZONE_FOUND_AREA
             info["enemy_region"] = region_name
+            info["enemy_danger_close"] = (
+                region_name == "bottom" and enemy_area > SAFE_ZONE_DANGER_AREA
+            )
 
     return info
