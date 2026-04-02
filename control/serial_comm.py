@@ -1,4 +1,12 @@
-from config import SERIAL_BAUDRATE, SERIAL_ENABLED, SERIAL_PORT, SERIAL_TIMEOUT
+import time
+
+from config import (
+    SERIAL_BAUDRATE,
+    SERIAL_ENABLED,
+    SERIAL_PORT,
+    SERIAL_REPEAT_INTERVAL_SEC,
+    SERIAL_TIMEOUT,
+)
 from control.protocol import motion_to_byte
 
 try:
@@ -8,10 +16,17 @@ except Exception:
 
 
 class SerialController:
-    def __init__(self):
-        # last_command 用于避免连续发送完全相同的指令。
+    CONTINUOUS_COMMANDS = {"F", "L", "R", "B", "S", "SEARCH", "FAST_RIGHT", "TURN_AND_ADVANCE"}
+
+    def __init__(self, serial_port=None, time_fn=None, repeat_interval=None):
+        # Resend drive commands at a low rate so the base keeps receiving motion updates.
         self.last_command = None
+        self.last_send_time = None
         self.ser = None
+        self.time_fn = time_fn or time.monotonic
+        self.repeat_interval = (
+            SERIAL_REPEAT_INTERVAL_SEC if repeat_interval is None else repeat_interval
+        )
 
         if not SERIAL_ENABLED:
             return
@@ -20,22 +35,45 @@ class SerialController:
             return
 
         try:
-            self.ser = serial.Serial(SERIAL_PORT, SERIAL_BAUDRATE, timeout=SERIAL_TIMEOUT)
+            port = SERIAL_PORT if serial_port is None else serial_port
+            self.ser = serial.Serial(port, SERIAL_BAUDRATE, timeout=SERIAL_TIMEOUT)
         except Exception as exc:
             print(f"serial open failed: {exc}")
             self.ser = None
 
     def send(self, command):
-        # 重复命令直接忽略，减轻串口负担，也避免下位机反复触发同一动作。
-        if command == self.last_command:
+        # One-shot arm/drop actions still send only on change to avoid retriggering.
+        now = self.time_fn()
+        same_command = command == self.last_command
+        continuous = command in self.CONTINUOUS_COMMANDS
+        repeat_due = (
+            same_command
+            and continuous
+            and self.last_send_time is not None
+            and (now - self.last_send_time) >= self.repeat_interval
+        )
+
+        if same_command and not repeat_due:
             return
+
         self.last_command = command
+        self.last_send_time = now
         print(f"motion={command}")
         cmd_byte = motion_to_byte(command)
         if self.ser is not None and cmd_byte is not None:
-            self.ser.write(bytes([cmd_byte]))
+            try:
+                self.ser.write(bytes([cmd_byte]))
+            except Exception as exc:
+                print(f"serial write failed: {exc}")
+                try:
+                    self.ser.close()
+                except Exception:
+                    pass
+                self.ser = None
+                # 恢复为可重试状态，避免后续同指令被“重复过滤”吞掉。
+                self.last_command = None
+                self.last_send_time = None
 
     def close(self):
-        # 程序退出前主动关闭串口。
         if self.ser is not None:
             self.ser.close()

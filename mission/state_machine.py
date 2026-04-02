@@ -1,4 +1,4 @@
-from config import TARGET_LOST_TOLERANCE_FRAMES
+from config import ENABLE_LOAD_REVIEW, ENABLE_REJECT_ITEM, TARGET_LOST_TOLERANCE_FRAMES
 from mission.task_config import GAME_RULES
 
 
@@ -91,7 +91,30 @@ class RescueMission:
             "target_lost_count": self.target_lost_count,
         }
 
-    def update(self, frame_width, target_info, quality_ok, safe_zone_info):
+    def _normalize_load_review_info(self, load_review_info):
+        if load_review_info is None:
+            return {
+                "available": False,
+                "reject_required": False,
+                "reason": "review_unavailable",
+            }
+        return {
+            "available": bool(load_review_info.get("available", False)),
+            "reject_required": bool(load_review_info.get("reject_required", False)),
+            "reason": load_review_info.get("reason", "review_ready"),
+        }
+
+    def _next_phase_after_pickup(self, task):
+        if ENABLE_LOAD_REVIEW and task.get("review_after_pickup", False):
+            self.phase = "REVIEW_LOAD"
+            return "review_load_after_pickup"
+        if self._should_continue_collecting(task):
+            self.phase = "SEARCH"
+            return "collect_next_target"
+        self.phase = "GO_SAFE_ZONE"
+        return "load_ready_for_safe_zone"
+
+    def update(self, frame_width, target_info, quality_ok, safe_zone_info, load_review_info=None):
         # 每一帧根据当前观测更新一次任务状态机。
         task = self._advance_to_next_unlocked_task()
         if task is None:
@@ -122,6 +145,7 @@ class RescueMission:
 
         center_tolerance = task["center_tolerance"]
         stop_area = task["stop_area"]
+        load_review = self._normalize_load_review_info(load_review_info)
 
         if self.phase == "SEARCH":
             # 搜索阶段：没看到目标就继续搜，看到目标就进入对中。
@@ -194,12 +218,36 @@ class RescueMission:
                     task.get("max_carry_count", GAME_RULES["max_carry_count"]),
                 )
                 self.substep_index = 0
-                if self._should_continue_collecting(task):
-                    self.phase = "SEARCH"
-                    note = "collect_next_target"
-                else:
-                    self.phase = "GO_SAFE_ZONE"
-                    note = "load_ready_for_safe_zone"
+                note = self._next_phase_after_pickup(task)
+
+        elif self.phase == "REVIEW_LOAD":
+            self.target_lost_count = 0
+            action = "S"
+            if not ENABLE_LOAD_REVIEW or not task.get("review_after_pickup", False):
+                note = self._next_phase_after_pickup(task)
+            elif not load_review["available"]:
+                note = "review_waiting"
+            elif load_review["reject_required"] and ENABLE_REJECT_ITEM:
+                self.phase = "REJECT_ITEM"
+                self.substep_index = 0
+                note = load_review["reason"]
+            else:
+                note = self._next_phase_after_pickup(task)
+
+        elif self.phase == "REJECT_ITEM":
+            self.target_lost_count = 0
+            sequence = task.get("reject_sequence", [])
+            if not ENABLE_REJECT_ITEM or not sequence:
+                note = self._next_phase_after_pickup(task)
+            else:
+                action = sequence[self.substep_index]
+                note = f"reject_action_{self.substep_index + 1}"
+                self.substep_index += 1
+                if self.substep_index >= len(sequence):
+                    self.substep_index = 0
+                    self.load_count = max(self.load_count - 1, 0)
+                    note = "reject_complete"
+                    self.phase = "SEARCH" if self.load_count == 0 else "REVIEW_LOAD"
 
         elif self.phase == "GO_SAFE_ZONE":
             # 找到己方安全区后直接接近，否则继续搜索安全区。

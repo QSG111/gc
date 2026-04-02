@@ -1,6 +1,7 @@
 import cv2
 
 from config import (
+    ENABLE_LOAD_REVIEW,
     USE_YOLO_DETECTOR,
     WINDOW_NAME,
     YOLO_FRAME_INTERVAL,
@@ -106,6 +107,19 @@ def detect_current_targets(frame, processed, target_colors, runtime):
     return merge_detection_results(color_results, yolo_results, target_colors)
 
 
+def build_load_review_info(mission):
+    # 暂未接入夹内复查视觉链路时，避免 REVIEW_LOAD 阶段无输入导致卡死。
+    if not ENABLE_LOAD_REVIEW:
+        return None
+    if mission.phase != "REVIEW_LOAD":
+        return None
+    return {
+        "available": True,
+        "reject_required": False,
+        "reason": "review_bypassed",
+    }
+
+
 def process_frame(frame, runtime):
     # 单帧处理函数，把主循环里的细节集中到这里，方便后续继续调赛规逻辑。
     mission = runtime["mission"]
@@ -129,7 +143,14 @@ def process_frame(frame, runtime):
     target_info = resolve_target_info(current_task, detections)
 
     # 状态机负责比赛流程，主循环只给它提供当前帧观测结果。
-    mission_info = mission.update(frame.shape[1], target_info, quality_info["ok"], safe_zone_info)
+    load_review_info = build_load_review_info(mission)
+    mission_info = mission.update(
+        frame.shape[1],
+        target_info,
+        quality_info["ok"],
+        safe_zone_info,
+        load_review_info=load_review_info,
+    )
     motion = decide_motion(quality_info, plan_info, escape_info, mission_info, safe_zone_info)
 
     return {
@@ -190,7 +211,11 @@ def release_runtime(runtime):
 
 def main():
     # 主函数尽量保持顺序化，方便现场直接看流程。
-    runtime = build_runtime()
+    try:
+        runtime = build_runtime()
+    except RuntimeError as exc:
+        print(f"startup failed: {exc}")
+        return
     cap = runtime["cap"]
 
     while cap.isOpened():

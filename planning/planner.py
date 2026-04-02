@@ -1,3 +1,6 @@
+from config import FORWARD_RATIO
+
+
 def plan_direction(drive_ratio, obstacle_info):
     # 基础规划策略：
     # 1. 正前方有障碍时优先绕开
@@ -8,7 +11,7 @@ def plan_direction(drive_ratio, obstacle_info):
             motion = "L"
         else:
             motion = "R"
-    elif drive_ratio >= 0.45:
+    elif drive_ratio >= FORWARD_RATIO:
         motion = "F"
     elif obstacle_info["left_ratio"] < obstacle_info["right_ratio"]:
         motion = "L"

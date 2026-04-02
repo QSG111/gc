@@ -1,9 +1,9 @@
 import unittest
 
 from control.decision import decide_motion
-from config import TARGET_LOST_TOLERANCE_FRAMES
+from config import ENABLE_LOAD_REVIEW, TARGET_LOST_TOLERANCE_FRAMES
 from mission.state_machine import RescueMission
-from mission.task_config import build_task_queue
+from mission.task_config import TARGET_SPECS, build_task_queue
 from config import SIDE_COLOR
 
 
@@ -121,7 +121,7 @@ class RescueMissionTests(unittest.TestCase):
         result = mission.update(640, target(found=False), True, safe_zone())
         self.assertEqual("SEARCH", result["phase"])
         self.assertEqual("SEARCH", result["action"])
-        self.assertEqual("red_lost", result["note"])
+        self.assertEqual(f"{SIDE_COLOR}_lost", result["note"])
 
     def test_enemy_safe_zone_close_forces_back_off(self):
         motion = decide_motion(
@@ -154,6 +154,43 @@ class RescueMissionTests(unittest.TestCase):
         self.assertEqual("GO_SAFE_ZONE", result["phase"])
         self.assertEqual("danger_requires_empty_load", result["note"])
         self.assertEqual("TURN_AND_ADVANCE", result["action"])
+
+    def test_pickup_stays_on_existing_flow_when_review_disabled(self):
+        mission = RescueMission(build_task_queue())
+
+        mission.update(640, target(found=True, center_x=320.0, area=2000.0), True, safe_zone())
+        mission.update(640, target(found=True, center_x=320.0, area=2000.0), True, safe_zone())
+        mission.update(640, target(found=True, center_x=320.0, area=25000.0), True, safe_zone())
+        mission.update(640, target(found=True, center_x=320.0, area=25000.0), True, safe_zone())
+        result = mission.update(
+            640,
+            target(found=True, center_x=320.0, area=25000.0),
+            True,
+            safe_zone(),
+            load_review_info={"available": True, "reject_required": True, "reason": "wrong_item"},
+        )
+
+        self.assertFalse(ENABLE_LOAD_REVIEW)
+        self.assertEqual("SEARCH", result["phase"])
+        self.assertEqual("collect_next_target", result["note"])
+
+    def test_review_and_reject_phases_are_reserved_but_safe_when_disabled(self):
+        task = dict(TARGET_SPECS["friendly_ordinary"])
+        task["review_after_pickup"] = True
+        mission = RescueMission([task])
+        mission.phase = "REVIEW_LOAD"
+        mission.load_count = 1
+
+        review_result = mission.update(
+            640,
+            target(found=False),
+            True,
+            safe_zone(),
+            load_review_info={"available": True, "reject_required": True, "reason": "wrong_item"},
+        )
+
+        self.assertEqual("SEARCH", review_result["phase"])
+        self.assertEqual("collect_next_target", review_result["note"])
 
 
 if __name__ == "__main__":
