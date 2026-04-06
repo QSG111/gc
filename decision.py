@@ -1,5 +1,5 @@
 class DecisionMaker:
-    """Direction-only controller for search and delivery phases."""
+    """仅负责搜索阶段和投放阶段的方向决策。"""
 
     def __init__(self, center_tolerance=50, stop_area=25000, safe_zone_area=22000):
         self.center_tolerance = int(center_tolerance)

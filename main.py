@@ -18,7 +18,7 @@ DELIVER = "DELIVER"
 
 
 class CarryManager:
-    """Track gripper occupancy and enforce transport rules."""
+    """维护夹爪占用状态，并约束搬运规则。"""
 
     def __init__(self, max_carry_count=2):
         self.max_carry_count = max(1, int(max_carry_count))
@@ -241,18 +241,18 @@ def main():
     grab_confirm_start_time = 0.0
 
     if not camera.open():
-        print("[Main] Failed to open camera.")
+        print("[Main] 摄像头打开失败。")
         return
 
     serial_controller.open()
     initialize_servos(serial_controller)
-    print("[Main] System started. Press Q to quit.")
+    print("[Main] 系统已启动，按 Q 退出。")
 
     try:
         while True:
             ok, frame = camera.read()
             if not ok or frame is None:
-                print("[Main] Failed to read frame.")
+                print("[Main] 读取画面失败。")
                 break
 
             quality_result = quality_judge.assess(frame)
@@ -382,6 +382,7 @@ def main():
 
                 if grab_confirm_count >= confirm_frames_required:
                     if carry_manager.register_grab(action_context["side"], action_context["target_type"]):
+                        detector.register_pick_result(action_context["target_label"])
                         phase = DELIVER if carry_manager.should_deliver_now() else SEARCH
                     else:
                         phase = SEARCH

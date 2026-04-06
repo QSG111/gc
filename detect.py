@@ -6,8 +6,8 @@ import numpy as np
 
 class Detector:
     """
-    Primary color detection with low-frequency YOLO assistance.
-    Color detection is always available. YOLO can be gated by image quality.
+    以颜色检测为主，辅以低频 YOLO 检测。
+    颜色检测始终可用，YOLO 是否启用由画面质量控制。
     """
 
     def __init__(self, yolo_model_path=None, yolo_stride=5, yolo_classes=None):
@@ -16,20 +16,22 @@ class Detector:
         self.yolo_classes = yolo_classes or ["person", "sports ball", "bottle"]
         self.last_yolo_result = []
         self.yolo_model = self._load_yolo_model(yolo_model_path)
+        self.normal_count = 0
+        self.yellow_picked = False
 
     def _load_yolo_model(self, yolo_model_path):
         if not yolo_model_path:
             return None
         if not os.path.exists(yolo_model_path):
-            print(f"[Detector] YOLO weight missing: {yolo_model_path}")
+            print(f"[Detector] 未找到 YOLO 权重文件: {yolo_model_path}")
             return None
         try:
             from ultralytics import YOLO
 
-            print(f"[Detector] Loading YOLO weights: {yolo_model_path}")
+            print(f"[Detector] 正在加载 YOLO 权重: {yolo_model_path}")
             return YOLO(yolo_model_path)
         except Exception as exc:
-            print(f"[Detector] YOLO init failed: {exc}")
+            print(f"[Detector] YOLO 初始化失败: {exc}")
             return None
 
     def detect(self, frame, team_color="red", allow_yolo=True):
@@ -55,40 +57,46 @@ class Detector:
             "yolo_enabled": yolo_enabled,
         }
 
+    def register_pick_result(self, label):
+        if label == "yellow_ball":
+            self.yellow_picked = True
+            return
+        self.normal_count += 1
+
     def _detect_color_targets(self, frame, team_color):
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         kernel = np.ones((5, 5), np.uint8)
 
         color_specs = [
             {
-                "name": "red",
+                "name": "red_ball",
                 "type": "normal",
-                "priority": 3 if team_color == "red" else 1,
+                "priority": 100,
                 "ranges": [
                     (np.array([0, 120, 70]), np.array([10, 255, 255])),
                     (np.array([160, 120, 70]), np.array([180, 255, 255])),
                 ],
             },
             {
-                "name": "blue",
+                "name": "blue_ball",
                 "type": "normal",
-                "priority": 3 if team_color == "blue" else 1,
+                "priority": 100,
                 "ranges": [
                     (np.array([100, 100, 60]), np.array([140, 255, 255])),
                 ],
             },
             {
-                "name": "black",
+                "name": "black_ball",
                 "type": "core",
-                "priority": 4,
+                "priority": 80,
                 "ranges": [
                     (np.array([0, 0, 0]), np.array([180, 255, 55])),
                 ],
             },
             {
-                "name": "yellow",
+                "name": "yellow_ball",
                 "type": "danger",
-                "priority": 2,
+                "priority": 120,
                 "ranges": [
                     (np.array([18, 90, 90]), np.array([38, 255, 255])),
                 ],
@@ -96,7 +104,18 @@ class Detector:
         ]
 
         candidates = []
+        own_ball_label = f"{team_color}_ball"
+        opponent_ball_label = "blue_ball" if team_color == "red" else "red_ball"
         for spec in color_specs:
+            if spec["name"] == opponent_ball_label:
+                continue
+            if spec["name"] != "yellow_ball" and spec["name"] != own_ball_label and spec["name"] != "black_ball":
+                continue
+            if spec["name"] != "yellow_ball" and self.normal_count >= 3:
+                continue
+            if spec["name"] == "yellow_ball" and (self.yellow_picked or self.normal_count == 0):
+                continue
+
             mask = None
             for lower, upper in spec["ranges"]:
                 current = cv2.inRange(hsv, lower, upper)
@@ -128,7 +147,7 @@ class Detector:
         return candidates
 
     def _min_area_for_target(self, color_name):
-        if color_name == "black":
+        if color_name == "black_ball":
             return 700
         return 500
 
@@ -219,7 +238,7 @@ class Detector:
                     )
             self.last_yolo_result = detections
         except Exception as exc:
-            print(f"[Detector] YOLO inference failed, keep previous result: {exc}")
+            print(f"[Detector] YOLO 推理失败，保留上一帧结果: {exc}")
 
         return self.last_yolo_result
 
