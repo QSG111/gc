@@ -1,239 +1,420 @@
+import time
+
 import cv2
 
-from config import (
-    ENABLE_LOAD_REVIEW,
-    USE_YOLO_DETECTOR,
-    WINDOW_NAME,
-    YOLO_FRAME_INTERVAL,
-    YOLO_MODEL_PATH,
-    YOLO_SEARCH_ONLY,
-)
-from control.decision import decide_motion
-from control.protocol import motion_to_text
-from control.serial_comm import SerialController
-from mission.state_machine import RescueMission
-from mission.task_config import build_task_queue
-from planning.escape import EscapeMonitor
-from planning.planner import plan_direction
-from ui.overlay import draw_status_panel
-from vision.camera import create_camera
-from vision.color_detector import ColorDetector
-from vision.color_targets import empty_target_info
-from vision.postprocess import merge_detection_results
-from vision.obstacle import detect_obstacles
-from vision.path_detect import extract_drive_mask, mask_center_ratio
-from vision.preprocess import preprocess_frame
-from vision.quality import evaluate_frame_quality
-from vision.safe_zone import detect_safe_zones
-from vision.yolo_detector import YoloDetector
+from camera import CameraReader
+from decision import DecisionMaker
+from detect import Detector
+from escape import EscapeController
+from executor import ActionExecutor
+from path import PathAnalyzer
+from quality import QualityJudge
+from serial import SerialController
+
+SEARCH = "SEARCH"
+GRAB = "GRAB"
+GRAB_CONFIRM = "GRAB_CONFIRM"
+DELIVER = "DELIVER"
 
 
-TARGET_TRACKING_PHASES = {"SEARCH", "ALIGN", "APPROACH", "PICKUP"}
+class CarryManager:
+    """Track gripper occupancy and enforce transport rules."""
 
+    def __init__(self, max_carry_count=2):
+        self.max_carry_count = max(1, int(max_carry_count))
+        self.slots = {"LEFT": None, "RIGHT": None}
 
-def build_runtime():
-    # 统一初始化运行时依赖，主循环里只保留读帧和处理流程。
-    color_detector = ColorDetector()
-    yolo_detector = None
-    if USE_YOLO_DETECTOR:
-        yolo_detector = YoloDetector(YOLO_MODEL_PATH)
-        yolo_detector.load()
+    def total_count(self):
+        return sum(1 for item in self.slots.values() if item is not None)
 
-    cap = create_camera()
-    return {
-        "cap": cap,
-        "serial": SerialController(),
-        "escape_monitor": EscapeMonitor(),
-        "mission": RescueMission(build_task_queue()),
-        "color_detector": color_detector,
-        "yolo_detector": yolo_detector,
-        "frame_index": 0,
-        "last_yolo_results": {},
-        "last_yolo_frame": -1,
-    }
+    def occupied_sides(self):
+        return [side for side, item in self.slots.items() if item is not None]
 
+    def free_sides(self):
+        return [side for side, item in self.slots.items() if item is None]
 
-def current_task_colors(mission):
-    # 只在找目标、对中、接近、抓取这几个阶段检测当前目标颜色，
-    # 避免每一帧都把所有目标颜色都跑一遍。
-    current_task = mission.current_task()
-    if current_task is None:
-        return []
-    if mission.phase not in TARGET_TRACKING_PHASES:
-        return []
-    return [current_task["target_color"]]
+    def has_danger(self):
+        return any(item == "danger" for item in self.slots.values() if item is not None)
 
+    def can_accept(self, target_type):
+        if target_type is None:
+            return False
+        if self.total_count() >= self.max_carry_count:
+            return False
+        if not self.free_sides():
+            return False
+        if target_type == "danger":
+            return self.total_count() == 0
+        return not self.has_danger()
 
-def resolve_target_info(current_task, detections):
-    # 从当前帧检测结果里取出当前任务真正关心的目标。
-    if current_task is None:
-        return empty_target_info()
-    return detections.get(current_task["target_color"], empty_target_info(current_task["target_color"]))
-
-
-def should_run_yolo(runtime, mission, target_colors):
-    # YOLO 只在启用后才参与，并且默认只在搜索阶段低频运行。
-    if runtime["yolo_detector"] is None or not target_colors:
-        return False
-    if YOLO_SEARCH_ONLY and mission.phase != "SEARCH":
-        return False
-    interval = max(int(YOLO_FRAME_INTERVAL), 1)
-    return runtime["frame_index"] % interval == 0
-
-
-def get_yolo_results(frame, processed, target_colors, runtime):
-    # 非触发帧直接复用上一轮 YOLO 结果，降低算力占用。
-    mission = runtime["mission"]
-    if not should_run_yolo(runtime, mission, target_colors):
-        return runtime["last_yolo_results"]
-
-    yolo_results = runtime["yolo_detector"].detect(frame, processed, target_colors)
-    runtime["last_yolo_results"] = yolo_results
-    runtime["last_yolo_frame"] = runtime["frame_index"]
-    return yolo_results
-
-
-def detect_current_targets(frame, processed, target_colors, runtime):
-    # 当前项目默认先走颜色检测，YOLO 作为低频补充检测。
-    if not target_colors:
-        runtime["last_yolo_results"] = {}
-        return {}
-
-    color_results = runtime["color_detector"].detect(frame, processed, target_colors)
-    if runtime["yolo_detector"] is None:
-        return color_results
-
-    yolo_results = get_yolo_results(frame, processed, target_colors, runtime)
-    return merge_detection_results(color_results, yolo_results, target_colors)
-
-
-def build_load_review_info(mission):
-    # 暂未接入夹内复查视觉链路时，避免 REVIEW_LOAD 阶段无输入导致卡死。
-    if not ENABLE_LOAD_REVIEW:
+    def choose_side(self, preferred_side):
+        if preferred_side in self.free_sides():
+            return preferred_side
+        fallback_side = "RIGHT" if preferred_side == "LEFT" else "LEFT"
+        if fallback_side in self.free_sides():
+            return fallback_side
         return None
-    if mission.phase != "REVIEW_LOAD":
+
+    def register_grab(self, side, target_type):
+        if side not in self.slots or self.slots[side] is not None:
+            return False
+        self.slots[side] = target_type
+        return True
+
+    def should_deliver_now(self):
+        if self.total_count() == 0:
+            return False
+        if self.has_danger():
+            return True
+        return self.total_count() >= self.max_carry_count or not self.free_sides()
+
+    def clear(self):
+        self.slots = {"LEFT": None, "RIGHT": None}
+
+
+def initialize_servos(serial_controller):
+    serial_controller.send_camera("SEARCH")
+    serial_controller.send_sync("MID")
+    serial_controller.send_left_gripper("OPEN")
+    serial_controller.send_right_gripper("OPEN")
+
+
+def pick_grab_candidate(detection_result):
+    target = detection_result.get("color_target")
+    if target is None:
         return None
+    if target.get("target_type") not in {"normal", "core", "danger"}:
+        return None
+    return target
+
+
+def choose_gripper_side(target, frame_width):
+    return "LEFT" if target["center_x"] < frame_width // 2 else "RIGHT"
+
+
+def is_grab_ready(target, frame_width, center_tolerance, grab_area):
+    if target is None:
+        return False
+    offset_x = abs(target["center_x"] - frame_width // 2)
+    return offset_x <= center_tolerance and target["area"] >= grab_area
+
+
+def make_action_context(target, side):
     return {
-        "available": True,
-        "reject_required": False,
-        "reason": "review_bypassed",
+        "side": side,
+        "target_label": target["label"],
+        "target_type": target["target_type"],
+        "target_center_x": target["center_x"],
+        "target_area": target["area"],
     }
 
 
-def process_frame(frame, runtime):
-    # 单帧处理函数，把主循环里的细节集中到这里，方便后续继续调赛规逻辑。
-    mission = runtime["mission"]
-    current_task = mission.current_task()
-    target_colors = current_task_colors(mission)
+def confirm_grab_success(detection_result, action_context, frame_width):
+    frame_center_x = frame_width // 2
+    expected_side = action_context["side"]
+    expected_label = action_context["target_label"]
+    expected_type = action_context["target_type"]
+    expected_center_x = action_context["target_center_x"]
+    expected_area = action_context["target_area"]
 
-    # 预处理阶段统一生成 HSV 和灰度图，减少重复颜色空间转换。
-    processed = preprocess_frame(frame)
-    hsv = processed["hsv"]
-    gray = processed["gray"]
+    for target in detection_result.get("color_targets", []):
+        same_side = (
+            expected_side == "LEFT" and target["center_x"] < frame_center_x
+        ) or (
+            expected_side == "RIGHT" and target["center_x"] >= frame_center_x
+        )
+        if not same_side:
+            continue
 
-    # 轻量视觉链路：可通行区域、障碍、当前任务目标、安全区、画面质量。
-    drive_mask = extract_drive_mask(hsv)
-    obstacle_info = detect_obstacles(frame)
-    detections = detect_current_targets(frame, processed, target_colors, runtime)
-    safe_zone_info = detect_safe_zones(hsv)
-    quality_info = evaluate_frame_quality(gray)
-    center_ratio = mask_center_ratio(drive_mask)
-    plan_info = plan_direction(center_ratio, obstacle_info)
-    escape_info = runtime["escape_monitor"].update(frame, plan_info["motion"])
-    target_info = resolve_target_info(current_task, detections)
+        similar_label = target["label"] == expected_label
+        similar_type = target["target_type"] == expected_type
+        near_previous_position = abs(target["center_x"] - expected_center_x) <= 140
+        still_large = target["area"] >= expected_area * 0.35
 
-    # 状态机负责比赛流程，主循环只给它提供当前帧观测结果。
-    load_review_info = build_load_review_info(mission)
-    mission_info = mission.update(
-        frame.shape[1],
-        target_info,
-        quality_info["ok"],
-        safe_zone_info,
-        load_review_info=load_review_info,
-    )
-    motion = decide_motion(quality_info, plan_info, escape_info, mission_info, safe_zone_info)
+        if (similar_label or similar_type) and (near_previous_position or still_large):
+            return False
 
-    return {
-        "drive_mask": drive_mask,
-        "quality_info": quality_info,
-        "obstacle_info": obstacle_info,
-        "plan_info": plan_info,
-        "escape_info": escape_info,
-        "safe_zone_info": safe_zone_info,
-        "mission_info": mission_info,
-        "target_info": target_info,
-        "motion": motion,
-    }
+    return True
 
 
-def draw_target_box(frame, target_info):
-    # 只把当前任务目标画出来，避免调试画面信息过多。
-    if not target_info["found"] or target_info["bbox"] is None:
-        return
+def draw_debug(
+    frame,
+    detection_result,
+    path_result,
+    quality_result,
+    decision_result,
+    escaped,
+    executor_active,
+    team_color,
+    phase,
+    carrying_count,
+    occupied_sides,
+    grab_confirm_count,
+):
+    h, w = frame.shape[:2]
 
-    x, y, w, h = target_info["bbox"]
-    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 255), 2)
-    cv2.putText(
-        frame,
-        f"{target_info['color']} area={target_info['area']:.0f}",
-        (x, max(y - 10, 20)),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        (0, 255, 255),
-        2,
-    )
+    target = detection_result["target"]
+    if target is not None:
+        x, y, bw, bh = target["bbox"]
+        color = (0, 255, 0) if target["source"] == "color" else (255, 255, 0)
+        cv2.rectangle(frame, (x, y), (x + bw, y + bh), color, 2)
+        cv2.putText(
+            frame,
+            f'{target["source"]}:{target["label"]}',
+            (x, max(25, y - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            color,
+            2,
+        )
 
+    safe_zone = detection_result.get("safe_zone")
+    if safe_zone is not None:
+        x, y, bw, bh = safe_zone["bbox"]
+        cv2.rectangle(frame, (x, y), (x + bw, y + bh), (255, 0, 255), 2)
+        cv2.putText(
+            frame,
+            safe_zone["label"],
+            (x, min(h - 10, y + bh + 20)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 0, 255),
+            2,
+        )
 
-def show_debug_window(frame, frame_result):
-    # 左侧保留原画面，右侧显示可通行区域二值图，便于现场调参。
-    mask_bgr = cv2.cvtColor(frame_result["drive_mask"], cv2.COLOR_GRAY2BGR)
-    preview = cv2.hconcat([frame, mask_bgr])
-    draw_status_panel(
-        preview,
-        quality_info=frame_result["quality_info"],
-        obstacle_info=frame_result["obstacle_info"],
-        plan_info=frame_result["plan_info"],
-        escape_info=frame_result["escape_info"],
-        motion_text=motion_to_text(frame_result["motion"]),
-        mission_info=frame_result["mission_info"],
-        safe_zone_info=frame_result["safe_zone_info"],
-    )
-    draw_target_box(preview, frame_result["target_info"])
-    cv2.imshow(WINDOW_NAME, preview)
+    path_mask_small = cv2.resize(path_result["mask"], (w // 4, h // 4))
+    path_mask_bgr = cv2.cvtColor(path_mask_small, cv2.COLOR_GRAY2BGR)
+    frame[0 : h // 4, 0 : w // 4] = path_mask_bgr
 
+    target_area = 0.0 if target is None else target["area"]
+    zone_area = 0.0 if safe_zone is None else safe_zone["area"]
+    status_lines = [
+        f"Phase: {phase}",
+        f"CMD: {decision_result['command']}",
+        f"Reason: {decision_result['reason']}",
+        f"Path: {path_result['best_direction']}",
+        f"Target area: {target_area:.0f}",
+        f"Zone area: {zone_area:.0f}",
+        f"Carry count: {carrying_count}",
+        f"Carry sides: {','.join(occupied_sides) if occupied_sides else '-'}",
+        f"Team: {team_color}",
+        f"Target: {decision_result['target_label']}/{decision_result['target_type']}",
+        f"Grip side: {decision_result['gripper_side']}",
+        f"Grab confirm: {grab_confirm_count}",
+        f"Quality: {'GOOD' if quality_result['is_good'] else 'BAD'}",
+        f"YOLO: {'ON' if detection_result['yolo_enabled'] else 'OFF'}",
+        f"Escape: {'ON' if escaped else 'OFF'}",
+        f"Executor: {'RUN' if executor_active else 'IDLE'}",
+    ]
 
-def release_runtime(runtime):
-    # 统一释放串口、摄像头和窗口资源。
-    runtime["serial"].close()
-    runtime["cap"].release()
-    cv2.destroyAllWindows()
+    y = 25
+    for line in status_lines:
+        cv2.putText(frame, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 255, 255), 2)
+        y += 24
 
 
 def main():
-    # 主函数尽量保持顺序化，方便现场直接看流程。
-    try:
-        runtime = build_runtime()
-    except RuntimeError as exc:
-        print(f"startup failed: {exc}")
+    team_color = "red"
+    max_carry_count = 2
+    grab_center_tolerance = 50
+    grab_area = 18000
+    confirm_frames_required = 3
+    confirm_timeout_seconds = 1.2
+
+    camera = CameraReader(camera_id=0, width=640, height=480)
+    detector = Detector(
+        yolo_model_path=None,
+        yolo_stride=5,
+        yolo_classes=["person", "sports ball", "bottle"],
+    )
+    path_analyzer = PathAnalyzer()
+    quality_judge = QualityJudge()
+    decision_maker = DecisionMaker(center_tolerance=50, stop_area=25000, safe_zone_area=22000)
+    escape_controller = EscapeController(stop_threshold=12)
+    serial_controller = SerialController(port="COM3", baudrate=115200, enable_serial=False)
+    executor = ActionExecutor(serial_controller)
+    carry_manager = CarryManager(max_carry_count=max_carry_count)
+
+    phase = SEARCH
+    action_context = None
+    grab_confirm_count = 0
+    grab_confirm_start_time = 0.0
+
+    if not camera.open():
+        print("[Main] Failed to open camera.")
         return
-    cap = runtime["cap"]
 
-    while cap.isOpened():
-        ok, frame = cap.read()
-        if not ok:
-            print("cannot read camera frame")
-            break
+    serial_controller.open()
+    initialize_servos(serial_controller)
+    print("[Main] System started. Press Q to quit.")
 
-        # 处理当前帧，得到状态机动作和调试信息。
-        frame_result = process_frame(frame, runtime)
-        runtime["serial"].send(frame_result["motion"])
-        show_debug_window(frame, frame_result)
-        runtime["frame_index"] += 1
+    try:
+        while True:
+            ok, frame = camera.read()
+            if not ok or frame is None:
+                print("[Main] Failed to read frame.")
+                break
 
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
+            quality_result = quality_judge.assess(frame)
+            path_result = path_analyzer.analyze(frame)
+            detection_result = detector.detect(
+                frame,
+                team_color=team_color,
+                allow_yolo=quality_result["is_good"],
+            )
 
-    release_runtime(runtime)
+            frame_width = frame.shape[1]
+            escaped = False
+            should_release = False
+            decision_result = {
+                "command": "STOP",
+                "reason": "idle",
+                "gripper_side": action_context["side"] if action_context else None,
+                "target_type": action_context["target_type"] if action_context else None,
+                "target_label": action_context["target_label"] if action_context else None,
+            }
+
+            if phase == SEARCH:
+                if carry_manager.total_count() > 0 and carry_manager.should_deliver_now():
+                    phase = DELIVER
+                    decision_result["reason"] = "switch_to_deliver"
+                else:
+                    target = detection_result.get("target")
+                    direction = decision_maker.decide_search(target, path_result, frame_width)
+                    decision_result.update(direction)
+                    if target is not None:
+                        decision_result["target_type"] = target.get("target_type")
+                        decision_result["target_label"] = target.get("label")
+                        decision_result["gripper_side"] = choose_gripper_side(target, frame_width)
+
+                    grab_target = pick_grab_candidate(detection_result)
+                    if grab_target is not None:
+                        preferred_side = choose_gripper_side(grab_target, frame_width)
+                        actual_side = carry_manager.choose_side(preferred_side)
+                        if (
+                            actual_side is not None
+                            and carry_manager.can_accept(grab_target["target_type"])
+                            and is_grab_ready(
+                                grab_target,
+                                frame_width,
+                                center_tolerance=grab_center_tolerance,
+                                grab_area=grab_area,
+                            )
+                        ):
+                            action_context = make_action_context(grab_target, actual_side)
+                            phase = GRAB
+                            decision_result["command"] = "STOP"
+                            decision_result["reason"] = "switch_to_grab"
+                            decision_result["target_type"] = grab_target["target_type"]
+                            decision_result["target_label"] = grab_target["label"]
+                            decision_result["gripper_side"] = actual_side
+
+            if phase == GRAB:
+                decision_result = {
+                    "command": "STOP",
+                    "reason": "execute_grab",
+                    "gripper_side": action_context["side"] if action_context else None,
+                    "target_type": action_context["target_type"] if action_context else None,
+                    "target_label": action_context["target_label"] if action_context else None,
+                }
+
+            if phase == GRAB_CONFIRM:
+                decision_result = {
+                    "command": "STOP",
+                    "reason": "confirm_grab",
+                    "gripper_side": action_context["side"] if action_context else None,
+                    "target_type": action_context["target_type"] if action_context else None,
+                    "target_label": action_context["target_label"] if action_context else None,
+                }
+
+            if phase == DELIVER:
+                safe_zone = detection_result.get("safe_zone")
+                direction = decision_maker.decide_delivery(safe_zone, path_result, frame_width)
+                decision_result = {
+                    "command": direction["command"],
+                    "reason": direction["reason"],
+                    "gripper_side": action_context["side"] if action_context else None,
+                    "target_type": action_context["target_type"] if action_context else None,
+                    "target_label": "carry_to_safe_zone",
+                }
+                if carry_manager.total_count() == 0:
+                    phase = SEARCH
+                    decision_result["command"] = "STOP"
+                    decision_result["reason"] = "empty_delivery"
+                elif direction["reason"] == "safe_zone_reached":
+                    should_release = True
+
+            command = decision_result["command"]
+            if phase == SEARCH:
+                command, escaped = escape_controller.check_and_override(command, path_result)
+                decision_result["command"] = command
+
+            if not executor.active:
+                serial_controller.send_chassis(command)
+
+            if phase == GRAB and action_context is not None and not executor.active:
+                if executor.trigger_grab(action_context["side"], action_context["target_type"]):
+                    decision_result["reason"] = "grab_started"
+
+            if phase == DELIVER and should_release and not executor.active:
+                if executor.trigger_release(carry_manager.occupied_sides()):
+                    decision_result["reason"] = "release_started"
+
+            executor_active = executor.update()
+
+            if executor.just_finished == "grab":
+                phase = GRAB_CONFIRM
+                grab_confirm_count = 0
+                grab_confirm_start_time = time.time()
+                executor.just_finished = None
+            elif executor.just_finished == "release":
+                carry_manager.clear()
+                action_context = None
+                phase = SEARCH
+                grab_confirm_count = 0
+                executor.just_finished = None
+
+            if phase == GRAB_CONFIRM and action_context is not None:
+                if confirm_grab_success(detection_result, action_context, frame_width):
+                    grab_confirm_count += 1
+                else:
+                    grab_confirm_count = 0
+
+                if grab_confirm_count >= confirm_frames_required:
+                    if carry_manager.register_grab(action_context["side"], action_context["target_type"]):
+                        phase = DELIVER if carry_manager.should_deliver_now() else SEARCH
+                    else:
+                        phase = SEARCH
+                    action_context = None
+                    grab_confirm_count = 0
+                elif time.time() - grab_confirm_start_time >= confirm_timeout_seconds:
+                    phase = SEARCH
+                    action_context = None
+                    grab_confirm_count = 0
+
+            draw_debug(
+                frame=frame,
+                detection_result=detection_result,
+                path_result=path_result,
+                quality_result=quality_result,
+                decision_result=decision_result,
+                escaped=escaped,
+                executor_active=executor_active,
+                team_color=team_color,
+                phase=phase,
+                carrying_count=carry_manager.total_count(),
+                occupied_sides=carry_manager.occupied_sides(),
+                grab_confirm_count=grab_confirm_count,
+            )
+            cv2.imshow("SRP Simplified", frame)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                break
+    finally:
+        camera.release()
+        serial_controller.close()
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":

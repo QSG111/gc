@@ -1,84 +1,97 @@
-# rescue_vision
+# rescue_car
 
-基于 Python + OpenCV 的救援小车上位机视觉与任务控制项目。
+救援小车视觉控制项目，当前实现按以下原则组织：
 
-当前版本目标是先保证比赛可用、便于联调，再逐步升级为更强感知与更完整协议。
+- 颜色检测为主，YOLO 为辅助
+- 图像质量差时关闭 YOLO，但保留颜色检测
+- 状态机固定为 `SEARCH -> GRAB -> GRAB_CONFIRM -> DELIVER`
+- `Decision` 只负责方向控制
+- `Executor` 只负责动作执行
+- `main` 负责状态机、抓取确认和整体流程
 
-## 项目结构
+## 代码结构
 
 ```text
-rescue_vision/
-├─ main.py                  # 主循环：感知 -> 状态机 -> 决策 -> 串口
-├─ config.py                # 全局参数
-├─ vision/                  # 视觉模块
-├─ mission/                 # 任务状态机与规则
-├─ planning/                # 基础规划与脱困
-├─ control/                 # 动作协议与串口发送
-├─ ui/                      # 调试信息叠加显示
-└─ tests/                   # 单元测试
+camera.py    相机读取
+detect.py    颜色主检测、安全区检测、低频 YOLO 辅助检测
+decision.py  方向控制决策（SEARCH / DELIVER）
+executor.py  抓取与释放动作序列执行
+path.py      地面可通行方向分析
+quality.py   图像质量判断
+escape.py    SEARCH 阶段的简单脱困覆盖
+serial.py    串口命令映射与发送
+main.py      状态机、抓取确认、运载流程、模块调度
 ```
 
-## 单帧主流程
+## 当前流程
 
-`main.py` 每帧执行顺序如下：
+### 1. SEARCH
 
-1. 采集摄像头画面
-2. 图像预处理（模糊、可选 CLAHE、生成 HSV/灰度）
-3. 提取可通行区域
-4. 检测障碍物密度
-5. 检测当前任务目标（颜色检测，YOLO 可选低频补充）
-6. 检测己方/敌方安全区
-7. 评估画质（亮度与清晰度）
-8. 更新任务状态机
-9. 融合状态机与规划信息做动作决策
-10. 串口发送动作并显示调试画面
+- 始终运行颜色检测
+- 仅在画质良好时低频运行 YOLO
+- `DecisionMaker.decide_search()` 只输出底盘方向
+- `main.py` 根据颜色目标是否居中、是否接近、夹爪是否空闲来决定是否切到 `GRAB`
 
-## 任务与规则
+### 2. GRAB
 
-任务类型：
+- `main.py` 进入 `GRAB` 状态后，只触发 `ActionExecutor.trigger_grab()`
+- `executor.py` 按固定时序执行停车、下放、闭合、抬起、后退
 
-- `friendly_ordinary`
-- `core_target`
-- `danger_target`
+### 3. GRAB_CONFIRM
 
-已实现关键规则：
+- 抓取动作完成后进入确认状态
+- 通过“目标是否在原侧消失”做连续多帧确认
+- 确认成功才登记夹爪占用并继续任务
+- 超时未确认则回到 `SEARCH`
 
-- 己方普通目标优先，完成后才解锁共享目标。
-- 普通/核心目标支持累计装载，默认最多 3 个。
-- 危险目标要求空载后再抓取，且单独搬运。
-- 投放后需要连续确认，避免误判“已完成”。
-- 目标短暂丢失有容错帧，避免状态抖动。
+### 4. DELIVER
 
-状态机主阶段：
+- `DecisionMaker.decide_delivery()` 只负责朝安全区行驶
+- 到达安全区后，`main.py` 触发 `ActionExecutor.trigger_release()`
+- 释放完成后清空载物状态并回到 `SEARCH`
 
-`SEARCH -> ALIGN -> APPROACH -> PICKUP -> GO_SAFE_ZONE -> DROP -> CONFIRM_DROP -> NEXT_TASK -> DONE`
+## 设计约束对应
 
-## 运行方式
+### 识别策略
+
+- `detect.py` 中 `color_target` 永远优先于 `yolo_target`
+- 抓取候选只从颜色目标里选，不依赖 YOLO 直接触发抓取
+
+### 图像质量策略
+
+- `main.py` 中调用 `detector.detect(..., allow_yolo=quality_result["is_good"])`
+- 画质差时仅禁用 YOLO，颜色目标和安全区检测继续运行
+
+### 职责边界
+
+- `decision.py` 不再返回 `should_grab`、`gripper_side` 等流程字段
+- `executor.py` 不参与状态切换，只执行动作序列
+- `main.py` 统一负责状态迁移、抓取确认、运载切换
+
+## 运行
+
+安装基础依赖：
 
 ```powershell
-cd C:\Users\联想\Desktop\rescue_vision
+pip install opencv-python numpy
+```
+
+如需 YOLO：
+
+```powershell
+pip install ultralytics
+```
+
+运行：
+
+```powershell
 python main.py
 ```
 
-退出：按 `q`。
+默认是串口调试模式：
 
-## 常用调参项（config.py）
-
-- `SIDE_COLOR`: 己方颜色（`red` / `blue`）
-- `SERIAL_ENABLED`: 是否启用串口发送
-- `BINARIZE_THRESHOLD`: 可通行区阈值
-- `MIN_BRIGHTNESS`: 最低亮度
-- `MIN_LAPLACIAN_VARIANCE`: 最低清晰度
-- `TARGET_LOST_TOLERANCE_FRAMES`: 目标丢失容错帧数
-- `YOLO_FRAME_INTERVAL`: YOLO 触发间隔帧
-- `YOLO_SEARCH_ONLY`: 是否只在 SEARCH 阶段触发 YOLO
-
-## 测试
-
-```powershell
-python -m unittest discover -s tests -v
+```python
+SerialController(port="COM3", baudrate=115200, enable_serial=False)
 ```
 
-## 编码说明
-
-项目文本统一使用 UTF-8。若终端出现中文乱码，请先切换终端代码页到 UTF-8 后再查看文本内容。
+上车前按实际串口修改 `port`，并把 `enable_serial` 改为 `True`。
